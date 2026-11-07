@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<!--
+  strata-Qwen38FN-UnslothAIGGUF — physical weight atlas + live telemetry.
+  Single page, zero dependencies. Requires: WebGL2 (Chrome/FF), atlas_data.js
+  (from tools/build_atlas.py), and telemetry.json (from collect/collector.py;
+  served mode exposes it at /api/telemetry).
+
+  Layout: fullscreen WebGL2 canvas (the atlas) + DOM HUD overlays:
+    top-left  : engine phase, tok/s, prompt/output totals, MTP accept ring
+    top-right : GPU util/temp/power, VRAM, PCIe, RAM, conversation cache
+    bottom    : sparklines (gpu_util, tok_s) + rolling engine event log
+    hover     : expert cell -> layer, expert id, shard byte ranges from
+                native_experts.txt (gate/up/down regions, bytes/expert, bpw)
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Qwen3.8-Flash-Next — WebGL weight atlas + Strata telemetry</title>
+<style>
+  :root{--fg:#c9d4e3;--dim:#5b6b82;--bg:#070a12;--acc:#39e0ff;--ok:#3fe07f;--warn:#ffb02e;}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:12px/1.45 ui-monospace,"Cascadia Code",Menlo,monospace;overflow:hidden}
+  #gl{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .hud{position:absolute;pointer-events:none;padding:8px 10px;border-radius:8px;
+    background:rgba(8,12,22,.78);border:1px solid #1c2740;backdrop-filter:blur(3px)}
+  #tl{top:10px;left:10px;min-width:300px}
+  #tr{top:10px;right:10px;min-width:280px}
+  #bt{bottom:10px;left:10px;right:10px;display:flex;gap:10px;align-items:stretch}
+  #bt .hud{flex:1}
+  h1{font-size:13px;margin:0 0 6px;color:var(--acc);font-weight:600;letter-spacing:.4px}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:1px 10px}
+  .kv b{color:var(--dim);font-weight:400}
+  .big{font-size:20px;color:#fff}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+  canvas.spark{width:100%;height:46px;display:block}
+  #events{height:96px;overflow:hidden;font-size:11px;color:var(--dim);
+    display:flex;flex-direction:column-reverse}
+  #tip{position:absolute;display:none;max-width:380px;z-index:5}
+  #tip .name{color:#fff}
+  #legend{position:absolute;bottom:130px;right:10px;font-size:11px;color:var(--dim)}
+  #legend i{display:inline-block;width:9px;height:9px;margin-right:4px;vertical-align:-1px}
+  #help{position:absolute;top:10px;left:50%;transform:translateX(-50%);color:var(--dim);font-size:11px}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="tl" class="hud">
+  <h1>Qwen3.8 Flash Next · Unsloth UD IQ2_XS · Strata 0.1.57 · RTX A5000</h1>
+  <div class="kv">
+    <b>phase</b><span id="phase" class="big">idle</span>
+    <b>decode</b><span><span id="toks" class="big">0</span> tok/s
+       <span class="dim" id="generated"></span></span>
+    <b>prompt / out</b><span id="totals">0 / 0 tokens</span>
+    <b>prompt hit</b><span id="hit">–</span>
+    <b>MTP drafts</b><span id="mtp">accepted / offered</span>
+    <b>expert cache</b><span id="ecache">–</span>
+    <b>resident experts</b><span id="resident">5175 / 5175 slots (VRAM, no eviction)</span>
+    <b>routing overlay</b><span class="warn">synthetic (API exposes no per-token expert ids)</span>
+  </div>
+</div>
+
+<div id="tr" class="hud">
+  <h1>hardware</h1>
+  <div class="kv">
+    <b>GPU</b><span id="gpu">–</span>
+    <b>VRAM</b><span id="vram">–</span>
+    <b>temp / power</b><span id="tp">–</span>
+    <b>PCIe</b><span id="pcie">–</span>
+    <b>CPU / RAM</b><span id="cram">–</span>
+    <b>conv-cache</b><span id="ccache">–</span>
+  </div>
+</div>
+
+<div id="help">drag&nbsp;orbit · wheel&nbsp;zoom · right-drag&nbsp;pan · click&nbsp;pick · r&nbsp;reset</div>
+
+<div id="legend" class="hud">
+  <div><i style="background:#1ad9f2"></i>full-attention blk (L%4==3)</div>
+  <div><i style="background:#d940e6"></i>SSM blk (linear attn, 3/4 of blocks)</div>
+  <div><i style="background:#27405f"></i>expert cell (colour = profile heat)</div>
+  <div><i style="background:#ffb80d"></i>routed active this token (synthetic top-10)</div>
+  <div><i style="background:#cfe28a"></i>token particle · <i style="background:#40e673"></i>MTP draft loop</div>
+  <div><i style="background:#ffe040"></i>PLE notch (blk.1 n-gram embed)</div>
+</div>
+
+<div id="bt">
+  <div class="hud" style="max-width:520px">
+    <h1>sparklines</h1>
+    gpu_util %<canvas id="sp1" class="spark"></canvas>
+    decode tok/s<canvas id="sp2" class="spark"></canvas>
+  </div>
+  <div class="hud">
+    <h1>engine events</h1>
+    <div id="events"></div>
+  </div>
+</div>
+
+<div id="tip" class="hud"></div>
+
+<script src="atlas_data.js"></script>
+<script src="atlas_gl.js"></script>
+<script>
+"use strict";
+/* ============================ boot ======================================= */
+const $=id=>document.getElementById(id);
+if(!window.ATLAS_META){document.body.innerHTML=
+  "<p style='padding:2em'>missing web/atlas_data.js — run: python3 tools/build_atlas.py</p>";throw 0;}
+const META=window.ATLAS_META, HEAT=window.ATLAS_HEAT;
+const cv=$("gl"), gl=new AtlasGL(cv,META,HEAT);
+
+/* ======================= telemetry polling =============================== */
+/* collector.py writes live/telemetry.json; served mode maps /api/telemetry. */
+let TEL={events:[]}, seenEvents=0, sp1=[], sp2=[];
+async function poll(){
+  for(const u of ["api/telemetry","../live/telemetry.json","telemetry.json"]){
+    try{
+      const r=await fetch(u,{cache:"no-store"}); if(!r.ok)continue;
+      TEL=await r.json(); gl.setTelemetry(TEL); renderHud(); return;
+    }catch(e){/* try next */}
+  }
+}
+setInterval(poll,1500); poll();
+
+const pct=x=>(100*x).toFixed(1)+"%";
+function renderHud(){
+  const live=TEL.live||{}, hw=TEL.hardware||{}, tot=TEL.totals||{}, cc=TEL.conversation_cache||{}, eng=TEL.engine||{};
+  $("phase").textContent=live.phase||TEL.state||"idle";
+  $("toks").textContent=(live.tok_s||0).toFixed(1);
+  $("generated").textContent=live.generated?` · gen ${(live.generated).toLocaleString()} tok`:"";
+  $("totals").textContent=`${(tot.prompt_tokens||0).toLocaleString()} in / ${(tot.output_tokens||0).toLocaleString()} out`;
+  const hr=tot.prompt_tokens? tot.reused/tot.prompt_tokens : 0;
+  $("hit").textContent=pct(hr)+` (${((tot.prompt_tokens||0)-(tot.reused||0)).toLocaleString()} fresh)`;
+  const off=tot.drafts_offered||0, ac=tot.drafts_accepted||0;
+  $("mtp").innerHTML=`<span class="ok">${ac.toLocaleString()}</span> / ${off.toLocaleString()} (${off?pct(ac/off):"–"}) accepted`;
+  $("ecache").textContent=eng.expert_slots?`${eng.expert_slots} slots · ${eng.expert_cache_mib} MiB VRAM`:"–";
+  $("gpu").textContent=hw.gpu_util!=null?`${hw.gpu_util.toFixed(0)} %`:"–";
+  if(hw.gpu_mem_used!=null){
+    const g=hw.gpu_mem_used/(1<<30),t=hw.gpu_mem_total/(1<<30);
+    $("vram").innerHTML=`<span class="${g/t>0.95?"warn":"ok"}">${g.toFixed(1)} / ${t.toFixed(1)} GiB</span>`;
+  }
+  $("tp").textContent=hw.gpu_temp!=null?`${hw.gpu_temp.toFixed(0)} °C · ${hw.gpu_power.toFixed(1)} / ${(hw.gpu_power_limit||122.5).toFixed(0)} W`:"–";
+  $("pcie").textContent=eng.pcie_frac!=null?`KV stream budget ${pct(eng.pcie_frac)} · gen ${(hw.gpu_pcie_gen||"–")}`:"–";
+  $("cram").textContent=hw.cpu!=null?`${hw.cpu.toFixed(0)} % CPU · ${hw.ram_used.toFixed(1)} / ${hw.ram_total.toFixed(1)} GiB`:"–";
+  $("ccache").textContent=cc.slots!=null?`${cc.reused_requests||cc.reused||"-"} reused · ${cc.parked} parked · ${cc.evictions} evicted`:"–";
+  /* sparks */
+  if(hw.gpu_util!=null){sp1.push(hw.gpu_util); if(sp1.length>240)sp1.shift();}
+  if(live.tok_s!=null){sp2.push(live.tok_s); if(sp2.length>240)sp2.shift();}
+  drawSpark($("sp1"),sp1,100,"#39e0ff"); drawSpark($("sp2"),sp2,60,"#3fe07f");
+  /* event log: last 9 entries, newest first */
+  const box=$("events"); box.innerHTML="";
+  for(const e of (TEL.events||[]).slice(-9)){
+    const d=document.createElement("div");
+    d.textContent=`${e.t||""} ${e.type||""} ${Object.entries(e).filter(([k])=>!["t","type"].includes(k)).map(([k,v])=>k+"="+(typeof v==="number"?v.toLocaleString():v)).join(" ")}`;
+    box.prepend(d);
+  }
+}
+function drawSpark(c,arr,max,col){
+  const dpr=devicePixelRatio||1; c.width=c.clientWidth*dpr; c.height=c.clientHeight*dpr;
+  const x=c.getContext("2d"); x.clearRect(0,0,c.width,c.height);
+  x.strokeStyle=col; x.lineWidth=1.4*dpr; x.beginPath();
+  arr.forEach((v,i)=>{const px=i/(arr.length-1||1)*c.width, py=c.height-Math.min(1,v/max)*(c.height-4)-2;
+    i?x.lineTo(px,py):x.moveTo(px,py);});
+  x.stroke();
+}
+
+/* ========================== picking / tooltip ============================ */
+const tip=$("tip");
+cv.addEventListener("mousemove",ev=>{
+  gl.pick=gl.pickAt(ev.clientX,ev.clientY);
+  const p=gl.pick;
+  if(!p){tip.style.display="none";return;}
+  let html="";
+  if(p.type==="expert"){
+    const L=META.layers[p.layer], dims=META.dims, eb=L.expert_blob;
+    const perGate=eb?eb.gate_bytes/dims.experts:0, perDown=eb?eb.down_bytes/dims.experts:0;
+    html=`<span class="name">layer ${p.layer} · expert ${p.expert}</span><br>
+      block kind: ${L.kind}${L.ple?" + PLE":""}<br>
+      profile heat (co-routing edges): ${HEAT[p.layer][p.expert]}<br>
+      resident in VRAM cache: ${HEAT[p.layer][p.expert]>0?"yes (warmed from profile)":"tail (profiled cold, paged on demand)"}<br>
+      gate+up region: ${(eb?eb.gate_bytes:0).toLocaleString()} B / 512 → ${(perGate/1024).toFixed(0)} KiB · ~${(perGate*8/(dims.expert_ffn*dims.hidden)).toFixed(2)} bpw<br>
+      down region: ${(eb?eb.down_bytes:0).toLocaleString()} B / 512 → ${(perDown/1024).toFixed(0)} KiB · ~${(perDown*8/(dims.expert_ffn*dims.hidden)).toFixed(2)} bpw<br>
+      shard: ${eb?eb.shard:"–"}<br>
+      byte window: ${eb?("0x"+(eb.down_off+p.expert*perDown).toString(16)+" … 0x"+(eb.gate_off+p.expert*(perGate*2)).toString(16)):"–"}`;
+  }else if(p.type==="plate"){
+    const L=META.layers[p.layer], dims=META.dims, ts=denseTensors(p.layer);
+    html=`<span class="name">block ${p.layer}</span> — ${L.kind}, ${L.tensors} dense tensors, ${(L.pool_bytes/2**20).toFixed(1)} MiB pool<br>
+      experts: 512 routed + 1 shared · top-${dims.top_k_experts}<br>
+      ${dims.hyper_connections.count}-stream hyper-connection (rank ${dims.hyper_connections.low_rank})<br>
+      profile heat: Σ${L.profile.heat_sum} max${L.profile.heat_max} nz${L.profile.nonzero}/512<br>
+      tensors: ${ts.slice(0,6).map(t=>t.name.replace("blk."+p.layer+".","")).join(", ")}${ts.length>6?" …":""}`;
+  }else if(p.type==="embedding"){
+    const d=META.dims, t=META.dense_tensors.find(t=>t.name==="token_embd.weight");
+    html=`<span class="name">token_embd.weight</span><br>
+      vocab ${d.vocab.toLocaleString()} × hidden ${d.hidden} — quant ${t.quant||t.dtype} ${t.bpw?("("+t.bpw+" bpw)"):""}<br>
+      row = token id; lookup position animates on emitted tokens<br>
+      PLE n-gram embed (blk.1): n=${d.ple.ngram_size}, heads/ngram=${d.ple.heads_per_ngram}, ple_key 2560×10240 f32`;
+  }else if(p.type==="head"){
+    const t=META.dense_tensors.find(t=>t.name==="output.weight");
+    html=`<span class="name">output.weight</span> (${t.quant||t.dtype})<br>hidden ${META.dims.hidden} → vocab ${META.dims.vocab}<br>sampling defaults: top_k ${META.dims.sampling_default.top_k}, top_p ${META.dims.sampling_default.top_p}, temp ${META.dims.sampling_default.temperature}`;
+  }else if(p.type==="mtp"){
+    html=`<span class="name">MTP draft layer</span> (mtp/rt)<br>
+      ${(META.mtp.files_bytes["experts.bin"]/2**20).toFixed(0)} MiB experts (${META.dims.experts}×${(META.mtp.files_bytes["experts.bin"]/META.dims.experts/1024).toFixed(0)} KiB) + ${(META.mtp.files_bytes["dense.bin"]/2**20).toFixed(0)} MiB dense<br>
+      ${META.mtp.tensors.length} tensors: fc_embedding, hc mixers, ${META.dims.heads}-head Q/2-head KV attn, indexer, 512-expert MoE`;
+  }
+  tip.innerHTML=html; tip.style.display="block";
+  tip.style.left=Math.min(ev.clientX+14,innerWidth-400)+"px";
+  tip.style.top=Math.min(ev.clientY+14,innerHeight-220)+"px";
+});
+cv.addEventListener("mouseleave",()=>tip.style.display="none");
+function denseTensors(L){return META.dense_tensors.filter(t=>t.name.startsWith("blk."+L+"."));}
+cv.addEventListener("click",ev=>{ /* fly to plate */
+  const p=gl.pickAt(ev.clientX,ev.clientY);
+  if(p&&p.type!=="mtp")gl.target=[...plateCenter(p.layer).slice(0,2),plateCenter(p.layer)[2]];
+});
+
+/* ============================ camera input =============================== */
+let drag=null;
+cv.addEventListener("pointerdown",e=>drag={b:e.button,x:e.clientX,y:e.clientY});
+addEventListener("pointerup",()=>drag=null);
+addEventListener("pointermove",e=>{
+  if(!drag)return;
+  const dx=e.clientX-drag.x, dy=e.clientY-drag.y; drag.x=e.clientX; drag.y=e.clientY;
+  if(drag.b===2){/* pan in view plane */
+    gl.target[0]-=dx*gl.orbDist*0.0016*Math.cos(gl.orbAz); gl.target[2]+=dx*gl.orbDist*0.0016*Math.sin(gl.orbAz);
+  }else{gl.orbAz-=dx*0.005; gl.orbEl=Math.min(1.45,Math.max(0.08,gl.orbEl+dy*0.005));}
+});
+cv.addEventListener("wheel",e=>{e.preventDefault();gl.orbDist=Math.min(1400,Math.max(40,gl.orbDist*(1+e.deltaY*0.001)));},{passive:false});
+cv.addEventListener("contextmenu",e=>e.preventDefault());
+addEventListener("keydown",e=>{if(e.key==="r"){gl.orbAz=0;gl.orbEl=0.9;gl.orbDist=520;gl.target=[0,0,104];}});
+
+/* ============================ render loop =============================== */
+let last=performance.now();
+(function loop(now){const dt=Math.min(0.05,(now-last)/1000);last=now;gl.frame(dt);requestAnimationFrame(loop);})(last);
+</script>
+</body>
+</html>

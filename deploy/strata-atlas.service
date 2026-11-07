@@ -1,0 +1,14 @@
+[Unit]
+Description=strata-Qwen38FN WebGL atlas server (collect + serve on :8091)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/strata-qwen38fn-unslothGGUF-RTX-telemetry
+ExecStartPre=%h/projects/strata-models/venv312/bin/python3 tools/build_atlas.py
+ExecStart=%h/projects/strata-models/venv312/bin/python3 collect/collector.py --serve-port 8091
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

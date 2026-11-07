@@ -1,0 +1,9 @@
+# runtime artifacts
+live/*.tmp
+__pycache__/
+*.pyc
+# keep the committed samples
+!live/telemetry.json
+!live/atlas_manifest.json
+# logs
+*.log
