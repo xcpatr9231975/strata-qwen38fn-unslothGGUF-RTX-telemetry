@@ -114,3 +114,30 @@ against the live engine when it is up.
 | `~/strata-models/mtp/rt/` | MTP drafter (`experts.bin`, `dense.bin`, `dense.txt`, `draft_vocab.bin`) |
 | `~/.local/share/strata/install/strata-unsloth-ud-iq2_xs.log` | engine log tail |
 | `http://127.0.0.1:8080/metrics` | engine JSON snapshot |
+
+
+## Live scene features
+
+- **Forward-pass visualisation** — one token particle per decoded token
+  travels the polyline `embedding → blk0…blk47 → head`; each block plate
+  lights up amber the instant the particle head arrives. The chip strip
+  (`EMB → HC0 mix → ATTN/SSM core → HC1 combine → ROUTER softmax →
+  10/512 experts → SHARED expert → HEAD`) tracks the particle's sub-block
+  stage live; during prefill it shows the read fraction.
+- **Expert accounting** — hovering a block plate reports the number of lit
+  expert cells *right now*; the HUD reports routed-expert lookups for the
+  last request (`experts.log` → `expert_cache` event, measured per-token)
+  next to the structural bound of 48 layers × top-10 = 480/token, plus the
+  cache-hit %. All 5,175 expert slots are VRAM-resident (`resident experts`
+  row): expert eviction cannot occur — only streamed weight loading can.
+  The per-token routing flash overlay itself remains **synthetic** (API
+  exposes no per-token expert ids).
+- **KV cache growth bar** — 32 ground cells (front-left, 1 cell ≈ 2,048
+  tokens of the 65,536 engine window): solid green = VRAM-resident prefix,
+  blue = KV streamed from RAM, the newest written cell flashes. HUD shows
+  occupancy in tokens + ≈MiB (int8, full-attn layers only), parked
+  conversation KV (GiB, slots, evictions). The `KV seq tokens` sparkline
+  keeps a 3-minute history.
+- **HUD layout** — engine panel top-left, hardware top-right, event log
+  bottom-left, sparklines bottom-right, stage strip centred above the
+  bottom bar (no window-edge overlap).

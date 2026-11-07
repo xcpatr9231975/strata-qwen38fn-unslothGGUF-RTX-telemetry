@@ -1,0 +1,2 @@
+[collector] serving http://127.0.0.1:8091/ (web: /home/cpatriaw/projects/strata-qwen38fn-unslothGGUF-RTX-telemetry/web)
+[collector] metrics=http://127.0.0.1:8080/metrics log=/home/cpatriaw/.local/share/strata/install/strata-unsloth-ud-iq2_xs.log out=/home/cpatriaw/projects/strata-qwen38fn-unslothGGUF-RTX-telemetry/live/telemetry.json

@@ -95,6 +95,8 @@ class AtlasGL{
     this._resize(); this._buildScene();
     /* per-frame mutable state */
     this.flash=new Float32Array(meta.dims.layers*meta.dims.experts); /* decay 0..1 */
+    this.layerAct=new Float32Array(meta.dims.layers); /* forward-pass arrival glow */
+    this.fwdStage={name:"idle",label:null,layer:-1};   /* (a) forward-pass tracker */
     this.particles=[]; this.tokAcc=0; this.specAcc=0;
     this.telemetry={}; this.pick=null;
     gl.enable(gl.DEPTH_TEST); gl.clearColor(0.015,0.018,0.03,1);
@@ -188,6 +190,13 @@ class AtlasGL{
     /* pipeline polyline for particles */
     this.path=[...this.embedC]; for(let L=0;L<dims.layers;L++){const c=plateCenter(L);this.path.push([c[0],2,c[2]]);}
     this.path.push([...this.headC]); this.pathLen=this._pathLen();
+    /* (c) KV-cache growth bar: 32 ground cells at the front-left; each cell =
+       capacity/32 tokens. Green = VRAM-resident (<= engine.kv_resident),
+       blue-grey = streamed from RAM, brightest = newest written cell. */
+    this.kvC=[-COLS*GAP_X/2-34, 0, GAP_Z*0.45];
+    this.kvDyn=[];
+    for(let i=0;i<32;i++) this._push(this.kvDyn,[this.kvC[0], this.kvC[2]+i*(4.9+0.35)],[5.0,2.45],[0,0,0],3);
+    this.kvBuf=this._upload(this.kvDyn); this.kvN=32;
   }
 
   _upload(arr){const gl=this.gl,b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);
@@ -215,9 +224,11 @@ class AtlasGL{
   /* --------------------------- live telemetry --------------------------- */
   setTelemetry(t){
     this.telemetry=t;
-    const live=t.live||{}, eng=t.engine||{};
+    const live=t.live||{}, eng=t.engine||{}, kv=t.kv||{};
     this.decodeSpeed=(live.tok_s||0);
     this.phase=live.phase||"idle";
+    this.prefillFrac=(live.phase==="prefill" && live.prompt_total)? (live.prompt_read||0)/live.prompt_total : null;
+    this.kvCap=kv.capacity_tokens||null; this.kvSeq=kv.seq_tokens||null; this.kvResident=kv.resident_tokens||null;
   }
 
   /* per-frame: synthesise top-K=10 routing per layer at token ticks,
@@ -235,8 +246,8 @@ class AtlasGL{
             Math.floor(Math.pow(Math.random(),1.6)*dims.experts)); /* bias to low ids is fine: heat array is the real signal for colours */
           this.flash[base+e]=1.0;
         }
-        this.particles.push({s:0,life:1,col:[0.9,0.95,0.6]}); /* one token particle */
       }
+      this.particles.push({s:0,life:1,col:[0.9,0.95,0.6],li:-1}); /* ONE token particle per token */
     }
     for(let i=0;i<this.flash.length;i++)if(this.flash[i]>0)this.flash[i]=Math.max(0,this.flash[i]-dt*2.2);
     /* MTP spec particles: offered rate from totals or live */
@@ -244,10 +255,38 @@ class AtlasGL{
     const offered=(tot.drafts_offered||0)>0?1:0;
     if(offered) { this.specAcc+=dt*Math.min(4,this.decodeSpeed/9);
       while(this.specAcc>=1){this.specAcc-=1;this.particles.push({s:0.985,mtp:true,life:1,col:[0.3,1,0.45]});}}
-    /* integrate particles */
+    /* integrate particles; (a) light each plate the token head arrives at */
     const speed=0.14*(1+(this.decodeSpeed||0)/24);
-    for(const p of this.particles){ p.s+=speed*(p.mtp?2:1)/this.meta.dims.layers* 4.6 *dt*10; if(p.s>1.05)p.life=0; }
+    const dims2=this.meta.dims;
+    for(const p of this.particles){
+      p.s+=speed*(p.mtp?2:1)/this.meta.dims.layers* 4.6 *dt*10; if(p.s>1.05)p.life=0;
+      if(!p.mtp){
+        const li=Math.min(dims2.layers-1, Math.floor(p.s*(dims2.layers+1))-1);
+        if(li>=0 && li!==p.li){ this.layerAct[li]=1; p.li=li; }
+      }
+    }
+    for(let i=0;i<this.layerAct.length;i++)if(this.layerAct[i]>0)this.layerAct[i]=Math.max(0,this.layerAct[i]-dt*1.6);
+    this._updateFwdStage(dims2);
     this.particles=this.particles.filter(p=>p.life>0).slice(-700);
+  }
+
+  /* (a) forward-pass stage: follow the token particle furthest along the
+     polyline embed -> blk0..47 -> head; each polyline segment is sub-phase-
+     bucketed into the block's internal pipeline. HUD strip + plate glow use it. */
+  static FWD_STAGES=["EMB","HC0 mix","ATTN/SSM core","HC1 combine","ROUTER softmax","10/512 experts","SHARED expert","HEAD"];
+  _updateFwdStage(dims){
+    let best=null;
+    for(const p of this.particles) if(!p.mtp && (!best||p.s>best.s)) best=p;
+    if(!best){this.fwdStage={name:"idle",label:null,layer:-1};return;}
+    const segs=this.path.length-1;            /* 49: embed..48 plates..head */
+    const f=best.s*segs;
+    let name,layer=-1;
+    if(f<1) name="EMB";
+    else if(f>=segs-1) name="HEAD";
+    else{ layer=Math.floor(f)-1;
+      const u=f-Math.floor(f);                /* 0..1 inside one block */
+      name=AtlasGL.FWD_STAGES[1+Math.min(6,Math.floor(u*7))]; }
+    this.fwdStage={name,label:(this.prefillFrac!=null?`prefill ${(this.prefillFrac*100).toFixed(0)}%`:this.phase),layer};
   }
 
   /* ------------------------------- frame ------------------------------- */
@@ -290,6 +329,23 @@ class AtlasGL{
     gl.bufferSubData(gl.ARRAY_BUFFER,0,this._dynArr);
     drawBatch(this.statBuf,this.statN,0.02);
     drawBatch(this.dynBuf,this.dynN,0.34);
+    /* (c) KV growth bar: colours re-computed per frame from telemetry */
+    if(!this._kvArr){this._kvArr=new Float32Array(this.kvN*8); this._kvArr.set(this.kvDyn);}
+    {
+      const cap=this.kvCap||65536, res=this.kvResident||0, seq=this.kvSeq||0, per=cap/32;
+      for(let i=0;i<32;i++){
+        const o=i*8, lo=i*per, lit=seq>lo;
+        let r,g,b;
+        if(!lit){r=0.05;g=0.06;b=0.09;}
+        else if(lo<res){r=0.10;g=0.80;b=0.35;}   /* VRAM-resident KV */
+        else {r=0.25;g=0.45;b=0.85;}             /* overflow: streamed from RAM */
+        const k=Math.abs(i-Math.min(31,Math.floor(seq/per)))<0.6?1.9:1; /* newest written cell pops */
+        this._kvArr[o+4]=Math.min(1,r*k); this._kvArr[o+5]=Math.min(1,g*k); this._kvArr[o+6]=Math.min(1,b*k);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER,this.kvBuf);
+      gl.bufferSubData(gl.ARRAY_BUFFER,0,this._kvArr);
+      drawBatch(this.kvBuf,this.kvN,0.12);
+    }
     /* particles additive */
     const parts=[];
     for(const p of this.particles){
@@ -298,6 +354,13 @@ class AtlasGL{
       else pos=this.pathPoint(Math.min(1,p.s));
       const col=scale(p.col,Math.max(0,p.life));
       this._push(parts,pos,[0.85,0.85],col,4);
+    }
+    /* (a) per-block forward-pass arrival glow: soft amber sheet over plates
+       the token head visited within the last ~0.6 s (additive pass) */
+    for(let L=0;L<this.layerAct.length;L++){
+      const a=this.layerAct[L];
+      if(a>0.03){ const c=plateCenter(L);
+        this._push(parts,[c[0],c[2]],[PLATE_W/2,PLATE_H/2],[1.0*a,0.72*a,0.08*a],4); }
     }
     if(parts.length){
       const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
@@ -361,6 +424,8 @@ class AtlasGL{
     }
     for(const [c,name] of [[this.embedC,"embedding"],[this.headC,"head"],[this.mtpC,"mtp"]])
       if(Math.abs(px-c[0])<20 && Math.abs(pz-c[2])<14) return {type:name};
+    if(Math.abs(px-this.kvC[0])<6 && pz>this.kvC[2]-3 && pz<this.kvC[2]+32*5.3)
+      return {type:"kv"};
     return null;
   }
 }

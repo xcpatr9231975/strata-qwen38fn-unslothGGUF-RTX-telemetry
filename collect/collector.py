@@ -102,8 +102,14 @@ class LogTailer:
         return new
 
 
-def compose(metrics, tailer, started):
-    """Merge engine metrics + parsed log state into the telemetry snapshot."""
+def compose(metrics, tailer, started, hist=None):
+    """Merge engine metrics + parsed log state into the telemetry snapshot.
+
+    `hist` is a persistent dict of deques kept across polls by the caller;
+    currently one series: kv.seq_tokens sampled every poll (KV growth curve).
+    """
+    if hist is None:
+        hist = {"kv": deque(maxlen=180)}
     out = {
         "ts": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -124,11 +130,61 @@ def compose(metrics, tailer, started):
         tot = metrics.get("totals") or {}
         off = tot.get("drafts_offered") or 0
         acc = tot.get("drafts_accepted") or 0
+        eng = metrics.get("engine") or {}
+        live = metrics.get("live") or {}
+        reqs = metrics.get("requests") or []
+        cc = metrics.get("conversation_cache") or {}
         out["derived"] = {
             "mtp_accept_rate": (acc / off) if off else None,
             "prompt_hit_rate": ((tot.get("reused") or 0) / tot["prompt_tokens"])
                                if tot.get("prompt_tokens") else None,
         }
+
+        # ---- (c) KV cache occupancy -------------------------------------
+        # engine.kv is the KV dtype (e.g. "int8"), kv_resident = tokens whose
+        # KV lives in VRAM, max_context = per-sequence capacity. Occupancy =
+        # the live sequence (prompt+generated) else the last finished req.
+        seq = None
+        if live.get("prompt_total") is not None:
+            seq = int(live["prompt_total"]) + int(live.get("generated") or 0)
+        elif reqs:
+            r0 = reqs[0]
+            seq = int(r0.get("prompt_tokens") or 0) + int(r0.get("output_tokens") or 0)
+        if seq is not None:
+            hist["kv"].append(seq)
+        out["kv"] = {
+            "dtype": eng.get("kv"),                        # "int8"
+            "capacity_tokens": eng.get("max_context"),     # 65536
+            "resident_tokens": eng.get("kv_resident"),     # VRAM-resident prefix
+            "seq_tokens": seq,                             # occupancy now (last/active)
+            "cache_bytes": cc.get("bytes"),                # parked conversation KV
+            "cache_slots": cc.get("slots"),
+            "parked": cc.get("parked"),
+            "evictions": cc.get("evictions"),
+            "series": list(hist["kv"]),                    # growth curve, one pt/poll
+        }
+
+        # ---- (b) experts actually called ----------------------------------
+        # Each `expert_cache` log line reports ONE request's totals: lookups
+        # (= tokens x 48 layers x top-10) and hits in the resident cache.
+        ec = dn = None
+        for ev in reversed(list(tailer.events)):
+            ty = ev.get("type")
+            if ec is None and ty == "expert_cache":
+                ec = ev
+            elif ec is not None and dn is None and ty == "done":
+                dn = ev
+                break
+        exp = {"per_token_structural": 48 * 10}  # every token touches 48 MoE layers x top-10
+        if ec:
+            exp["last_request_lookups"] = ec.get("lookups")
+            exp["last_request_hits"] = ec.get("hits")
+            exp["last_hit_pct"] = ec.get("hit_pct")
+            if dn and dn.get("tokens"):
+                exp["last_request_tokens"] = dn["tokens"]
+                if ec.get("lookups"):
+                    exp["per_token_measured"] = ec["lookups"] / dn["tokens"]
+        out["derived"]["experts"] = exp
     return out
 
 
@@ -188,6 +244,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     tailer = LogTailer(args.log, from_start=args.from_start or args.once)
+    hist = {"kv": deque(maxlen=180)}
     started = time.time()
     errors = 0
 
@@ -200,7 +257,7 @@ def main(argv=None):
     if args.once:
         m = fetch_json(args.metrics)
         tailer.pump()
-        snap = compose(m, tailer, started)
+        snap = compose(m, tailer, started, hist)
         snap["sources"]["metrics"]["url"] = args.metrics
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         with open(args.out, "w") as f:
@@ -219,7 +276,7 @@ def main(argv=None):
             if errors in (1, 10, 100):
                 print(f"[collector] metrics poll failed ({errors}x): {e}", flush=True)
         tailer.pump()
-        snap = compose(m, tailer, started)
+        snap = compose(m, tailer, started, hist)
         snap["sources"]["metrics"]["url"] = args.metrics
         tmp = args.out + ".tmp"
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
