@@ -7,6 +7,11 @@ GPU telemetry**. Replaces the dead vllama-era `qwen38-visual` telemetry: the
 collector speaks Strata's native JSON `/metrics` dialect and tails the
 engine log with a purpose-built parser.
 
+> 📚 **Full engineering dossier:** [`TECHNIQUES.md`](TECHNIQUES.md) — requirements,
+> every binary format decoded (GGUF v3, STRP, pack index, MTP), the WebGL2
+> renderer architecture, deployment, testing methodology, and the complete bug
+> catalogue with diagnoses.
+
 ## What the scene shows (every number comes from disk, nothing is faked)
 
 | Scene element | Source of truth | Meaning |
