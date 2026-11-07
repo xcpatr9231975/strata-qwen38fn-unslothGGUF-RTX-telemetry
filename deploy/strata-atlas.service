@@ -5,8 +5,8 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/projects/strata-qwen38fn-unslothGGUF-RTX-telemetry
-ExecStartPre=%h/projects/strata-models/venv312/bin/python3 tools/build_atlas.py
-ExecStart=%h/projects/strata-models/venv312/bin/python3 collect/collector.py --serve-port 8091
+ExecStartPre=/usr/bin/python3 tools/build_atlas.py
+ExecStart=/usr/bin/python3 collect/collector.py --serve-port 8091 --from-start
 Restart=always
 RestartSec=5
 
