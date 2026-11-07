@@ -1,148 +1,134 @@
 # strata-qwen38fn-unslothGGUF-RTX-telemetry
 
-Real-time **WebGL2 visualisation of the physical Qwen3.8-Flash-Next weight
-atlas** (512-expert-per-layer MoE, 48 blocks, IQ2_XS GGUF served by
-[Strata] 0.1.57 on an RTX A5000 Laptop GPU) **overlaid with live engine +
-GPU telemetry**. Replaces the dead vllama-era `qwen38-visual` telemetry: the
-collector speaks Strata's native JSON `/metrics` dialect and tails the
-engine log with a purpose-built parser.
+**A WebGL2 "physical weight atlas" for Qwen3.8-Flash-Next, alive with live engine
+telemetry.** 48 MoE blocks × 512 routed experts rendered where they actually
+*live on disk* — IQ2_XS byte ranges, shard numbers, quant kinds — overlaid with
+real-time forward-pass instrumentation, expert-call accounting and KV-cache
+growth, streamed from a Strata v0.1.57 inference engine running the Unsloth
+GGUF build on an RTX A5000 Laptop GPU (16 GiB).
 
-> 📚 **Full engineering dossier:** [`TECHNIQUES.md`](TECHNIQUES.md) — requirements,
-> every binary format decoded (GGUF v3, STRP, pack index, MTP), the WebGL2
-> renderer architecture, deployment, testing methodology, and the complete bug
-> catalogue with diagnoses.
+Every geometric fact is parsed from the model files; every moving colour is
+pulled from the engine's live metrics + log. Nothing in the scene is faked —
+the only synthetic overlay (per-token routing flicker) is labelled as such,
+both here and in the HUD.
 
-## What the scene shows (every number comes from disk, nothing is faked)
+### Live capture — mid-decode, 10 s loop
 
-| Scene element | Source of truth | Meaning |
+![Live atlas: engine thinking at ~16 tok/s, token particles crossing glowing
+blocks, KV bar filling, stage strip lit on ATTN/SSM core](docs/assets/atlas_demo.webp)
+
+*Smaller [GIF version](docs/assets/atlas_demo.gif) · [static
+frame](docs/assets/atlas_still.png) if animation is disabled.*
+
+---
+
+## What am I looking at
+
+| Scene element | What it is | Where the number comes from |
 |---|---|---|
-| 48 layer plates, 8×6 grid | GGUF `qwen4exp.block_count=48` | one plate per transformer block |
-| Rim colour cyan/magenta | `attention.full_attention_interval=4` | cyan = full-attention (L%4==3, 12 blocks); magenta = SSM/linear-attention (36 blocks, `state_size=128`, `inner_size=6144`, `time_step_rank=48`) |
-| 32×16 = **512 cells per plate** | `expert_count=512`, `expert_used_count=10` | one cell per routed expert; top-10 of 512 active per token/layer |
-| Cell tint (navy→teal→gold) | `expert-profile.bin` (magic `STRP`, 196 632 B) | heat = # co-routing edge endpoints from the 24 576 u16-pair edge records (12 288 hot edges, 12 288 cold tail rows); heat>0 ⇒ resident in the warmed VRAM cache ("pre-filled 5175 of 5175 slots from the profile … no eviction", 8 494 MiB) |
-| Amber flash on cells | synthesised top-K=10 | Strata's API exposes only the aggregate hit %, **not** per-token expert ids — routing flashes are synthetic and labelled as such in the HUD |
-| Router bar per plate | `ffn_gate_inp.weight` (2560×512 bf16, 2.62 MiB) | MoE gating projection |
-| Gold notch | GGUF `qwen4exp.ple.layers=[1]` | blk.1 hosts the PLE n-gram path (`ngram_size=3`, 8 heads/ngram, `ple_key.weight` 2560×10240 f32) |
-| Green slab (left) | `token_embd.weight`, vocab 248 320 × hidden 2 560 | embedding position space |
-| Purple slab (right) | `output.weight` (transposed) | LM head + sampling defaults (`top_k=30 top_p=0.9 temp=1.0`) |
-| Far green slab | `~/strata-models/mtp/rt/` (experts.bin 707.8 MiB / 512×1 382 400 B, dense.bin 116.1 MiB, 29 dense tensors) | MTP draft layer; green particles loop head→MTP→verify |
-| Token particles | live `tok_s` (≈34.8 decode) | polyline embed→blk0…47→head |
-| Hover tooltip | `native_experts.txt` (512 rows/layer: gate/up/down byte offsets per expert, shard column) | exact file offsets + bytes-per-weight of the expert under the cursor |
+| **48 glowing plates** (8×6 grid) | the transformer blocks; teal = full-attention (every 4th), indigo = SSM (hybrid) | `block_count`, `full_attention_interval` in the GGUF header |
+| **512 tiny tiles per plate** | the routed experts of that layer, heat-tinted by Strata's own *measured* routing profile (`STRP` blob) and byte-mapped to their IQ2_XS ranges in the GGUF shards | `expert-profile.bin` + pack `index.txt` + GGUF tensor index |
+| **amber tiles flashing** | a token just routed through this expert (overlay — the *colours* are real data, the flicker is evocative; the API exposes no per-token expert ids) | engine decode-rate scaled |
+| **EMB slab** | the 248,320 × 2,560 token embedding table | GGUF metadata |
+| **travelling spark** | one generated token walking `embed → 48 blocks → head`; plates glow amber on arrival | `live.tok_s` from `/metrics` |
+| **bottom stage strip** | the block-internal pipeline clock: `EMB · HC0 mix · ATTN/SSM core · HC1 combine · ROUTER softmax · 10/512 experts · SHARED expert · HEAD` | architecture metadata (stage *order*), particle position (which stage now) |
+| **green/blue bar (left)** | the KV cache: 32 cells = 65,536-token window; green = VRAM-resident, blue-grey = streamed from RAM, brightest = newest written | `engine.kv_resident`, live seq occupancy |
+| **green sparks behind the head** | MTP speculative-draft activity | `totals.drafts_offered/accepted` |
+| **HUD panels** | engine phase, decode tok/s, MTP accept %, expert-cache hits, experts called (measured vs structural), GPU/VRAM/PCIe, KV occupancy + growth sparkline, engine event log | `:8080/metrics` JSON + purpose-built log parser |
 
-## Telemetry pipeline
+## Live features
 
-```
-strata serve :8080 ── GET /metrics ──┐
-                                     ├─ collect/collector.py ─ live/telemetry.json
-engine log ── collect/log_parser.py ─┘        (atomic write, every 2 s)
-   ~/.local/share/strata/install/strata-unsloth-ud-iq2_xs.log
-                                     │ --serve-port 8091
-                                     └─ http://127.0.0.1:8091/  (web/index.html
-                                        + atlas_data.js + /api/telemetry)
-```
+- **Forward-pass instrumentation** — token particles, per-block arrival glow
+  and an 8-stage pipeline strip that follows the head of the pass in real time.
+- **Expert accounting** — structural (48 layers × top-10 = **480/token**) vs.
+  *measured* routing lookups from the engine log (e.g. 545.7/token for a
+  batched request), plus cache-hit % and the honest note that all **5,175
+  expert slots are VRAM-resident — no eviction ever happens**.
+- **KV-cache growth** — occupancy bar on the ground plane, 90 s growth-curve
+  sparkline, int8 byte estimate (6,144 B/token over the 12 full-attention
+  layers), parked-conversation KV.
 
-* **`/metrics` JSON**: `engine` (expert_slots=5175, expert_cache_mib, KV),
-  `live` (phase/tok_s), `requests`, `conversation_cache`, `hardware`
-  (GPU util/temp/power/VRAM, CPU/RAM), `history` arrays, `totals`
-  (`drafts_accepted/drafts_offered` → MTP accept rate, `reused/prompt_tokens`
-  → prompt-hit rate, both pre-derived in `derived`).
-* **`log_parser.py`** turns ~19 log dialects into typed events, incl. the
-  five Strata startup banners added here: `mtp_load`, `expert_prefill`,
-  `pool_workers`, `session_up`, `verify_setup` (plus req/reuse/spec/kv/
-  expert_cache/slot_save/cache_restore/borrow/done/engine_start/vram_warn).
-* **`collect/llm-scope.py`**: the original terminal dashboard, ported
-  (`import log_parser as P`), still works standalone:
-  `python3 collect/llm-scope.py --log ~/.local/share/strata/install/strata-unsloth-ud-iq2_xs.log`.
-
-## Atlas builder — `tools/build_atlas.py`
-
-Parses, from stdlib only (`struct`+`json`, no numpy):
-
-1. **GGUF v3 metadata** (3 shards, reads header+KV from shard 00001):
-   dims, SSM, hyper-connections (count=4 rank=320), indexer attention
-   (4 heads, k=128, top_k=2048), PLE, RoPE sections `[11,11,10,0]`,
-   `compress_ratios` pattern, quantisation (`general.file_type=20` IQ2_XS,
-   imatrix 926 entries).
-2. **`packs/unsloth-ud-iq2_xs/index.txt`** → 1 079 dense tensors with
-   stage classification (embedding_or_head / attention / indexer / ssm /
-   moe_router / moe_shared / hyper_connection / ple).
-3. **`native_experts.txt`** → per-layer byte regions of the expert blob
-   (total 42 283 827 200 B; per-expert gate+up vs down sizes → effective bpw
-   ≈ 2.55 / 1.28 for routed experts).
-4. **`expert-profile.bin`** (STRP header `[1,48,512,24576,24576,…]`, u16
-   stream at byte 24) → heat matrix + top-expert list.
-5. **`mtp/rt/dense.txt`** (6-column records) + file sizes → MTP structure.
-
-Outputs: `web/atlas_data.js` (`window.ATLAS_META` + `window.ATLAS_HEAT`,
-consumed directly by the renderer — no bundler) and
-`live/atlas_manifest.json` (full machine-readable manifest, ~250 KB).
-
-## Run
+## Quick start
 
 ```bash
-cd ~/projects/strata-qwen38fn-unslothGGUF-RTX-telemetry
-python3 tools/build_atlas.py            # once after model/pack changes
-python3 collect/collector.py --once     # single snapshot smoke test
-python3 collect/collector.py --serve-port 8091   # collector + web server
+# one-time (or automatic on every boot): build the static atlas from the model files
+python3 tools/build_atlas.py
+
+# run collector + HUD server on 127.0.0.1:8091
+python3 collect/collector.py --serve-port 8091 --from-start
 # open http://127.0.0.1:8091/
+
+# tests (stdlib unittest only — no pytest on the lab box, no numpy needed)
+python3 -m unittest discover -s test -v
 ```
 
-Camera: drag orbit · wheel zoom · right-drag pan · click fly-to · `r` reset.
-
-## Tests
+### Permanent deployment (systemd user unit, boot-persistent)
 
 ```bash
-python3 -m unittest discover -s test -v   # 12 tests, stdlib only
+systemctl --user enable --now deploy/strata-atlas.service
+loginctl enable-linger $USER          # without linger user units do NOT start at boot
 ```
 
-Cover GGUF v3 type-table decode (synthetic header), STRP decode round-trip,
-expert-blob arithmetic, dense.txt byte offsets, the five new parser events,
-multi-event completion-summary lines, and `compose()` snapshot derivation
-against the live engine when it is up.
+The unit rebuilds the atlas on boot (`ExecStartPre`), tails the engine log
+from the start (so boot-banner events like `mtp_load`, `expert_prefill
+5175/5175`, `session_up` land in the scene), and serves the dashboard +
+`/api/telemetry` from one stdlib-only process. `Restart=always`.
 
-## Known honesty notes
+## How it works (1-minute version)
 
-* Per-token expert activation is **synthetic** (heat-weighted top-K) — the
-  API publishes only aggregate expert-cache hit %; labelled in HUD/legend.
-* Heat model treats STRP rows as undirected (L,expert) endpoint pairs; the
-  12 288-record half is edge records, the rest decode to index maps.
-* Scene assumes the IQ2_XS UD pack + MTP RT drafter paths below; if the pack
-  moves, `build_atlas.py` flags missing files loudly rather than guessing.
+```
+GGUF headers · pack index.txt · expert-profile.bin (STRP) · MTP dense.txt
+        │  tools/build_atlas.py (offline, stdlib struct only)
+        ▼
+ web/atlas_data.js  ──────────────┐  static geometry: topology, byte maps, heat
+                                 ├──►  WebGL2 renderer (web/atlas_gl.js)
+ Strata :8080/metrics (JSON) ──┐  │   1 shader program, ≤4 instanced draws/frame,
+ engine log (tail -f) ──────────┤  │   analytic ray-plane picking
+        │  collect/log_parser.py │  │            ▲ 60 Hz
+        │  (≈25 event types)     ▼  │            │ 500 ms poll of /api/telemetry
+        └─► collect/collector.py ─► live/telemetry.json (atomic os.replace) ◄────┘
+                 └── embedded http.server on :8091 (static + API, no nginx)
+```
 
-## Absolute paths baked in as defaults (override with CLI flags)
+Full engineering dossier — requirements, every binary format decoded (GGUF v3
+type-enum trap, `STRP` layout forensics, MTP layout), the renderer internals
+(instance layout, SDF rimming, the `uY` layer-lifting trick, additive FX
+pass), deployment notes, testing methodology and a 13-entry bug catalogue with
+diagnoses: **[TECHNIQUES.md](TECHNIQUES.md)**.
 
-| Path | Contents |
+## Repo layout
+
+```
+collect/   collector.py (poll+tail+compose+serve) · log_parser.py (~25 event
+           types, fan-out contract) · llm-scope.py (salvaged predecessor)
+tools/     build_atlas.py — offline atlas builder (GGUF/STRP/pack/MTP parsers)
+web/       index.html (HUD) · atlas_gl.js (WebGL2) · atlas_data.js (generated)
+live/      telemetry.json · atlas_manifest.json (auditable, unit-annotated)
+test/      stdlib unittest suite (12 tests, runs without network)
+deploy/    systemd user units + notes
+docs/      assets (demo webp/gif/still) + TECHNIQUES.md lives one level up
+```
+
+## Served endpoints
+
+| Endpoint | Content |
 |---|---|
-| `~/strata-models/models/unsloth-UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-0000{1,2,3}-of-00003.gguf` | model shards (43.8+26.8+0.01 GB) |
-| `~/strata-models/packs/unsloth-ud-iq2_xs/` | `index.txt`, `native_experts.txt`, `conversions.json`, `expert-profile.bin` |
-| `~/.local/share/strata/components/control/0.1.57/data/expert-profile.bin` | canonical STRP profile |
-| `~/strata-models/mtp/rt/` | MTP drafter (`experts.bin`, `dense.bin`, `dense.txt`, `draft_vocab.bin`) |
-| `~/.local/share/strata/install/strata-unsloth-ud-iq2_xs.log` | engine log tail |
-| `http://127.0.0.1:8080/metrics` | engine JSON snapshot |
+| `/` | HUD + WebGL scene |
+| `/api/telemetry` | live telemetry snapshot (0.5 s cadence, atomic file behind it) |
+| `/api/atlas` | full atlas manifest (every number annotated with unit + source) |
 
+## Honest caveats
 
-## Live scene features
+- Per-token expert *flashes* are drawn from a measured routing profile —
+  Strata exposes no per-token expert ids, so the flicker pattern is
+  representative, not evidential. (HUD says so too.)
+- Block-internal stage timing is a geometric clock derived from the real
+  architecture stage order, not sub-layer telemetry.
+- KV byte figures are analytic (12 full-attention layers × GQA × int8); token
+  counts are real.
 
-- **Forward-pass visualisation** — one token particle per decoded token
-  travels the polyline `embedding → blk0…blk47 → head`; each block plate
-  lights up amber the instant the particle head arrives. The chip strip
-  (`EMB → HC0 mix → ATTN/SSM core → HC1 combine → ROUTER softmax →
-  10/512 experts → SHARED expert → HEAD`) tracks the particle's sub-block
-  stage live; during prefill it shows the read fraction.
-- **Expert accounting** — hovering a block plate reports the number of lit
-  expert cells *right now*; the HUD reports routed-expert lookups for the
-  last request (`experts.log` → `expert_cache` event, measured per-token)
-  next to the structural bound of 48 layers × top-10 = 480/token, plus the
-  cache-hit %. All 5,175 expert slots are VRAM-resident (`resident experts`
-  row): expert eviction cannot occur — only streamed weight loading can.
-  The per-token routing flash overlay itself remains **synthetic** (API
-  exposes no per-token expert ids).
-- **KV cache growth bar** — 32 ground cells (front-left, 1 cell ≈ 2,048
-  tokens of the 65,536 engine window): solid green = VRAM-resident prefix,
-  blue = KV streamed from RAM, the newest written cell flashes. HUD shows
-  occupancy in tokens + ≈MiB (int8, full-attn layers only), parked
-  conversation KV (GiB, slots, evictions). The `KV seq tokens` sparkline
-  keeps a 3-minute history.
-- **HUD layout** — engine panel top-left, hardware top-right, event log
-  bottom-left, sparklines bottom-right, stage strip centred above the
-  bottom bar (no window-edge overlap).
+---
+
+Lab tooling for the `qwen4exp` (Qwen3.8-Flash-Next) Unsloth UD-IQ2_XS GGUF on
+Strata 0.1.57. Supersedes the dead vllama-era
+[`qwen38-visual`](https://github.com/xcpatr9231975/qwen38-visual) telemetry.
