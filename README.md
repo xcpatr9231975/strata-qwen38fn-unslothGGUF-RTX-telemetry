@@ -12,13 +12,20 @@ pulled from the engine's live metrics + log. Nothing in the scene is faked —
 the only synthetic overlay (per-token routing flicker) is labelled as such,
 both here and in the HUD.
 
-### Live capture — mid-decode, 10 s loop
+### Live capture — one unbroken ~50 s take, mid-decode
 
-![Live atlas: engine thinking at ~16 tok/s, token particles crossing glowing
-blocks, KV bar filling, stage strip lit on ATTN/SSM core](docs/assets/atlas_demo.webp)
+![The whole clip, no cuts: the engine takes a long prompt and streams thinking,
+the attention wave sweeps the 8×6 expert grid on every decode step, amber tiles
+flash as experts get hit, the KV-residency bar and both sparklines climb, tokens
+per second swings in the GPU column, and the events pane scrolls real log
+lines](docs/assets/atlas_demo_50s.gif)
 
-*Smaller [GIF version](docs/assets/atlas_demo.gif) · [static
-frame](docs/assets/atlas_still.png) if animation is disabled.*
+*One ~50-second take of the live viewer (960×540, ~6 fps) while the engine
+decoded at ~22 tok/s — nothing composited in afterwards, the numbers and the
+colours are the same telemetry the HUD reads. Shorter cuts if animation is
+disabled or the load is too much: [10 s loop, webp](docs/assets/atlas_demo.webp)
+· [10 s GIF](docs/assets/atlas_demo.gif) · [static
+frame](docs/assets/atlas_still.png).*
 
 ---
 
@@ -106,7 +113,8 @@ web/       index.html (HUD) · atlas_gl.js (WebGL2) · atlas_data.js (generated)
 live/      telemetry.json · atlas_manifest.json (auditable, unit-annotated)
 test/      stdlib unittest suite (12 tests, runs without network)
 deploy/    systemd user units + notes
-docs/      assets (demo webp/gif/still) + TECHNIQUES.md lives one level up
+docs/      assets (50 s demo gif 9.9 MB · 10 s webp/gif · still) +
+           TECHNIQUES.md lives one level up
 ```
 
 ## Served endpoints
